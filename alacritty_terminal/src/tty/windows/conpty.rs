@@ -7,7 +7,11 @@ use winapi::shared::basetsd::{PSIZE_T, SIZE_T};
 use winapi::shared::minwindef::BYTE;
 use winapi::shared::ntdef::LPWSTR;
 use winapi::shared::winerror::S_OK;
-use winapi::um::consoleapi::{ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole};
+
+use winapi::shared::ntdef::{HANDLE, HRESULT};
+use winapi::shared::minwindef::{DWORD};
+use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress, LoadLibraryA};
+
 use winapi::um::processthreadsapi::{
     CreateProcessW, InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
     PROCESS_INFORMATION, STARTUPINFOW,
@@ -22,9 +26,18 @@ use crate::term::SizeInfo;
 use crate::tty::windows::child::ChildExitWatcher;
 use crate::tty::windows::{cmdline, win32_string, Pty};
 
+#[allow(non_snake_case)]
+struct ConptyApi {
+    CreatePseudoConsole:
+        unsafe extern "system" fn(COORD, HANDLE, HANDLE, DWORD, *mut HPCON) -> HRESULT,
+    ResizePseudoConsole: unsafe extern "system" fn(HPCON, COORD) -> HRESULT,
+    ClosePseudoConsole: unsafe extern "system" fn(HPCON),
+}
+
 /// RAII Pseudoconsole.
 pub struct Conpty {
     pub handle: HPCON,
+    api: ConptyApi,
 }
 
 impl Drop for Conpty {
@@ -33,7 +46,7 @@ impl Drop for Conpty {
         // conout pipe has already been dropped by this point.
         //
         // See PR #3084 and https://docs.microsoft.com/en-us/windows/console/closepseudoconsole.
-        unsafe { ClosePseudoConsole(self.handle) }
+        unsafe { (self.api.ClosePseudoConsole)(self.handle) }
     }
 }
 
@@ -53,16 +66,35 @@ pub fn new(config: &PtyConfig, size: &SizeInfo) -> Option<Pty> {
     let coord =
         coord_from_sizeinfo(size).expect("Overflow when creating initial size on pseudoconsole");
 
-    // Create the Pseudo Console, using the pipes.
-    let result = unsafe {
-        CreatePseudoConsole(
-            coord,
-            conin_pty_handle.into_raw_handle(),
-            conout_pty_handle.into_raw_handle(),
-            0,
-            &mut pty_handle as *mut HPCON,
-        )
-    };
+    let conpty_appi;
+    let result;
+
+    unsafe {
+        let mut hmodule = LoadLibraryA("conpty.dll\0".as_ptr() as _);
+        
+        if hmodule.is_null() {
+            hmodule = GetModuleHandleA("kernel32\0".as_ptr() as _);
+        }
+
+        let cpc = GetProcAddress(hmodule, "CreatePseudoConsole\0".as_ptr() as _);
+        let rpc = GetProcAddress(hmodule, "ResizePseudoConsole\0".as_ptr() as _);
+        let clpc = GetProcAddress(hmodule, "ClosePseudoConsole\0".as_ptr() as _);
+
+        conpty_appi = ConptyApi{
+                        CreatePseudoConsole: mem::transmute(cpc),
+                        ResizePseudoConsole: mem::transmute(rpc),
+                        ClosePseudoConsole: mem::transmute(clpc)
+                    };
+
+        // Create the Pseudo Console, using the pipes.
+        result = (conpty_appi.CreatePseudoConsole)(
+                coord,
+                conin_pty_handle.into_raw_handle(),
+                conout_pty_handle.into_raw_handle(),
+                0,
+                &mut pty_handle as *mut HPCON,
+            );
+    }
 
     assert_eq!(result, S_OK);
 
@@ -163,7 +195,7 @@ pub fn new(config: &PtyConfig, size: &SizeInfo) -> Option<Pty> {
     let conout = EventedAnonRead::new(conout);
 
     let child_watcher = ChildExitWatcher::new(proc_info.hProcess).unwrap();
-    let conpty = Conpty { handle: pty_handle };
+    let conpty = Conpty { handle: pty_handle, api: conpty_appi };
 
     Some(Pty::new(conpty, conout, conin, child_watcher))
 }
@@ -176,7 +208,7 @@ fn panic_shell_spawn() {
 impl OnResize for Conpty {
     fn on_resize(&mut self, sizeinfo: &SizeInfo) {
         if let Some(coord) = coord_from_sizeinfo(sizeinfo) {
-            let result = unsafe { ResizePseudoConsole(self.handle, coord) };
+            let result = unsafe { (self.api.ResizePseudoConsole)(self.handle, coord) };
             assert_eq!(result, S_OK);
         }
     }
